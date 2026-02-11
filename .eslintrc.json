@@ -1,0 +1,4 @@
+{
+  "extends": "next/core-web-vitals",
+  "ignorePatterns": ["tailwind.config.js", "postcss.config.js", "next.config.js"]
+}
