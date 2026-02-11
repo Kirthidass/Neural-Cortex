@@ -298,7 +298,13 @@ async function processDocumentWithAI(docId: string, content: string, userId: str
   }
 }
 
+// Allow larger uploads (video/audio files)
+export const maxDuration = 60; // seconds
+
+const MAX_UPLOAD_SIZE = 25 * 1024 * 1024; // 25MB
+
 export async function POST(req: NextRequest) {
+  try {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -319,6 +325,14 @@ export async function POST(req: NextRequest) {
     const file = formData.get('file') as File | null;
 
     if (file && file.size > 0) {
+      // Server-side file size validation
+      if (file.size > MAX_UPLOAD_SIZE) {
+        return NextResponse.json(
+          { error: `File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Maximum is 25MB.` },
+          { status: 413 }
+        );
+      }
+
       title = (formData.get('title') as string) || file.name;
       domain = (formData.get('domain') as string) || 'general';
       fileType = file.type || getFileExtension(file.name);
@@ -429,6 +443,15 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json({ document });
+  } catch (err: any) {
+    console.error('[Ingest POST] Unhandled error:', err?.message || err);
+    return NextResponse.json(
+      { error: err?.message?.includes('body') || err?.message?.includes('size')
+          ? 'File too large to process. Try a smaller file (max 25MB).'
+          : 'Failed to process file. Please try again.' },
+      { status: 500 }
+    );
+  }
 }
 
 export async function PATCH(req: NextRequest) {

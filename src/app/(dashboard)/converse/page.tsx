@@ -98,6 +98,9 @@ export default function ConversePage() {
     }
   };
 
+  const MAX_FILE_SIZE_MB = 25;
+  const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
+
   const handleFileUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setIsUploading(true);
@@ -105,6 +108,13 @@ export default function ConversePage() {
     let successCount = 0;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
+
+      // Client-side file size validation
+      if (file.size > MAX_FILE_SIZE) {
+        toast.error(`${file.name} is too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max ${MAX_FILE_SIZE_MB}MB.`);
+        continue;
+      }
+
       try {
         const formData = new FormData();
         formData.append('file', file);
@@ -118,10 +128,11 @@ export default function ConversePage() {
           successCount++;
         } else {
           const data = await res.json().catch(() => ({}));
-          toast.error(data.error || `Failed: ${file.name}`);
+          toast.error(data.error || `Failed to process ${file.name}`);
         }
       } catch (err) {
         console.error('Upload failed for', file.name, err);
+        toast.error(`Upload failed for ${file.name}. The file may be too large.`);
       }
     }
     setIsUploading(false);
@@ -139,7 +150,7 @@ export default function ConversePage() {
         },
       ]);
     } else {
-      toast.error('Upload failed. Try .txt, .md, or .json files.');
+      toast.error('Upload failed. Supported: .docx, .pdf, .pptx, .txt, .md, .json, .csv, audio & video (max 25MB).');
     }
   };
 
@@ -473,13 +484,13 @@ export default function ConversePage() {
                 >
                   <FileText className="w-8 h-8 mx-auto mb-2 text-text-secondary" />
                   <p className="text-sm text-text-secondary">Click to select files</p>
-                  <p className="text-xs text-text-secondary/60 mt-1">.docx, .pdf, .pptx, .txt, .md, .json, .csv supported</p>
+                  <p className="text-xs text-text-secondary/60 mt-1">.docx, .pdf, .pptx, .txt, .md, .json, .csv, audio & video supported (max 25MB)</p>
                 </div>
                 <input
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept=".txt,.md,.json,.csv,.text,.markdown,.docx,.pdf,.pptx"
+                  accept=".txt,.md,.json,.csv,.text,.markdown,.docx,.pdf,.pptx,.mp3,.wav,.m4a,.ogg,.flac,.aac,.wma,.mp4,.webm,.mkv,.avi,.mov,.wmv,.m4v,.png,.jpg,.jpeg,.gif,.bmp,.webp,.svg"
                   className="hidden"
                   onChange={(e) => handleFileUpload(e.target.files)}
                 />
