@@ -30,10 +30,14 @@ async function extractTextFromDocx(buffer: Buffer): Promise<string> {
 
 async function extractTextFromPdf(buffer: Buffer): Promise<string> {
   try {
-    const pdfModule = await import('pdf-parse');
-    const pdfParse = (pdfModule as any).default || pdfModule;
-    const result = await pdfParse(buffer);
-    return result.text || '';
+    const { PDFParse } = await import('pdf-parse');
+    const data = new Uint8Array(buffer);
+    const parser = new PDFParse({ data, verbosity: 0 } as any);
+    const result = await parser.getText();
+    await parser.destroy();
+    const text = result.text || '';
+    console.log(`PDF parsed successfully: ${text.length} characters extracted`);
+    return text;
   } catch (err) {
     console.error('PDF parse error:', err);
     return '';
