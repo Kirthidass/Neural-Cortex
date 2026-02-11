@@ -2,8 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import prisma from '@/lib/prisma';
-import { nvidiaChat, nvidiaChatStream, generateEmbeddingSimple } from '@/lib/nvidia';
-import { cosineSimilarity } from '@/lib/utils';
+import { nvidiaChat, nvidiaChatStream } from '@/lib/nvidia';
+import {
+  runAgents,
+  buildAgentSystemPrompt,
+  validateResponse,
+  type DocumentForRAG,
+} from '@/lib/agents';
 
 export async function GET(req: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -79,43 +84,24 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Message required' }, { status: 400 });
   }
 
-  // Find relevant documents using keyword matching + embedding similarity
+  // Fetch user's documents for the multi-agent knowledge expert
   const documents = await prisma.document.findMany({
     where: { userId: session.user.id },
     select: { id: true, title: true, content: true, summary: true, embedding: true },
   });
 
-  const queryEmbedding = generateEmbeddingSimple(message);
-
-  const scoredDocs = documents
-    .map((doc: { id: string; title: string; content: string; summary: string | null; embedding: string | null }) => {
-      let score = 0;
-
-      // Keyword matching
-      const queryWords = message.toLowerCase().split(/\s+/).filter((w: string) => w.length > 2);
-      const content = (doc.content + ' ' + doc.title + ' ' + (doc.summary || '')).toLowerCase();
-      for (const word of queryWords) {
-        if (content.includes(word)) score += 1;
-      }
-
-      // Embedding similarity
-      if (doc.embedding) {
-        try {
-          const docEmb = JSON.parse(doc.embedding);
-          score += cosineSimilarity(queryEmbedding, docEmb) * 5;
-        } catch {}
-      }
-
-      return { ...doc, score };
+  // Run multi-agent system: classifies intent → runs knowledge/search/youtube experts in parallel
+  const docsForRAG: DocumentForRAG[] = documents.map(
+    (d: { id: string; title: string; content: string; summary: string | null; embedding: string | null }) => ({
+      id: d.id,
+      title: d.title,
+      content: d.content,
+      summary: d.summary,
+      embedding: d.embedding,
     })
-    .sort((a: { score: number }, b: { score: number }) => b.score - a.score)
-    .slice(0, 3)
-    .filter((d: { score: number }) => d.score > 0);
+  );
 
-  // Build context from relevant documents
-  const context = scoredDocs
-    .map((d: { title: string; summary: string | null; content: string }) => `### ${d.title}\n${d.summary || d.content.slice(0, 1500)}`)
-    .join('\n\n');
+  const agentContext = await runAgents(message, docsForRAG);
 
   // Cross-conversation knowledge: pull relevant messages from OTHER conversations
   let crossConvoContext = '';
@@ -204,23 +190,8 @@ export async function POST(req: NextRequest) {
     },
   });
 
-  // Build AI messages
-  const systemPrompt = `You are Neural Cortex, an advanced AI personal knowledge twin assistant. You help users recall, connect, and build upon their stored knowledge.
-
-${
-  context
-    ? `## Relevant Knowledge Base Context:\n\n${context}\n\nUse this context to answer the user's question. When referencing documents, mention their titles clearly.`
-    : "The user's knowledge base doesn't have directly relevant documents for this query. Help with general knowledge and suggest they upload relevant documents."
-}${crossConvoContext}
-
-Guidelines:
-- Be concise, helpful, and accurate
-- Use markdown formatting for readability
-- Reference specific documents when applicable
-- When referencing insights from previous conversations, mention that naturally (e.g. "As we discussed before..." or "Based on your earlier inquiry...")
-- Suggest connections between concepts when you notice them
-- If unsure, be honest about limitations
-- Keep responses focused and under 500 words unless more detail is needed`;
+  // Build agent-enriched system prompt with knowledge base, web search, and YouTube results
+  const systemPrompt = buildAgentSystemPrompt(agentContext, crossConvoContext);
 
   const aiMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
     { role: 'system', content: systemPrompt },
@@ -231,7 +202,8 @@ Guidelines:
     { role: 'user', content: message },
   ];
 
-  const sources = scoredDocs.map((d: { id: string; title: string }) => ({ id: d.id, title: d.title }));
+  // Combine sources from all agents (documents, web search, YouTube)
+  const sources = agentContext.sources;
 
   // Streaming response
   if (useStream) {
@@ -303,13 +275,17 @@ Guidelines:
     }
   }
 
-  // Non-streaming response (fallback)
+  // Non-streaming response with multi-model fact-check validation
   try {
-    const response = await nvidiaChat({
+    const rawResponse = await nvidiaChat({
       messages: aiMessages,
       maxTokens: 2048,
       temperature: 0.7,
     });
+
+    // Cross-validate with HuggingFace model to reduce hallucination
+    const validationContext = [agentContext.knowledgeContext, agentContext.searchContext, agentContext.youtubeContext].filter(Boolean).join('\n\n');
+    const response = await validateResponse(rawResponse, message, validationContext);
 
     // Save assistant message
     await prisma.message.create({

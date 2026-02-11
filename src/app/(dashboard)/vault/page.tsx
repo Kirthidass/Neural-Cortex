@@ -81,6 +81,16 @@ export default function VaultPage() {
     return type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(type);
   };
 
+  const isAudioFile = (type: string | null) => {
+    if (!type) return false;
+    return type.startsWith('audio/') || ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'wma'].includes(type);
+  };
+
+  const isVideoFile = (type: string | null) => {
+    if (!type) return false;
+    return type.startsWith('video/') || ['mp4', 'webm', 'mkv', 'avi', 'mov', 'wmv', 'm4v'].includes(type);
+  };
+
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
@@ -95,6 +105,22 @@ export default function VaultPage() {
       'image/jpeg': ['.jpg', '.jpeg'],
       'image/gif': ['.gif'],
       'image/webp': ['.webp'],
+      // Audio files for meeting recordings, lectures, etc.
+      'audio/mpeg': ['.mp3'],
+      'audio/wav': ['.wav'],
+      'audio/x-m4a': ['.m4a'],
+      'audio/ogg': ['.ogg'],
+      'audio/flac': ['.flac'],
+      'audio/aac': ['.aac'],
+      'audio/x-ms-wma': ['.wma'],
+      // Video files for meeting recordings, lectures, etc.
+      'video/mp4': ['.mp4'],
+      'video/webm': ['.webm'],
+      'video/x-matroska': ['.mkv'],
+      'video/x-msvideo': ['.avi'],
+      'video/quicktime': ['.mov'],
+      'video/x-ms-wmv': ['.wmv'],
+      'video/x-m4v': ['.m4v'],
     },
   });
 
@@ -184,7 +210,7 @@ export default function VaultPage() {
         ) : (
           <>
             <p className="text-lg font-medium mb-1">Drop files here or click to upload</p>
-            <p className="text-text-secondary text-sm">Supports DOCX, PDF, PPTX, TXT, MD, JSON, CSV, PNG, JPG, GIF, WEBP files</p>
+            <p className="text-text-secondary text-sm">Supports DOCX, PDF, PPTX, TXT, MD, JSON, CSV, PNG, JPG + Audio (MP3, WAV, M4A) + Video (MP4, WEBM, MOV)</p>
           </>
         )}
       </div>
@@ -228,19 +254,17 @@ export default function VaultPage() {
                   >
                     <Eye className="w-4 h-4 text-text-secondary" />
                   </button>
-                  {!doc.summary && (
-                    <button
-                      onClick={() => processDocument(doc.id)}
-                      className="p-1.5 rounded-lg hover:bg-white/10 transition-colors"
-                      disabled={processing === doc.id}
-                      title="Process with AI"
-                    >
-                      <Brain
-                        className={`w-4 h-4 ${processing === doc.id ? 'text-neon-blue animate-pulse' : 'text-text-secondary'
-                          }`}
-                      />
-                    </button>
-                  )}
+                  <button
+                    onClick={() => processDocument(doc.id)}
+                    className="p-1.5 rounded-lg hover:bg-white/10 transition-colors"
+                    disabled={processing === doc.id}
+                    title={doc.summary ? 'Reprocess with AI' : 'Process with AI'}
+                  >
+                    <Brain
+                      className={`w-4 h-4 ${processing === doc.id ? 'text-neon-blue animate-pulse' : doc.summary ? 'text-neon-green' : 'text-text-secondary'
+                        }`}
+                    />
+                  </button>
                   <button
                     onClick={() => deleteDocument(doc.id)}
                     className="p-1.5 rounded-lg hover:bg-red-500/10 transition-colors"

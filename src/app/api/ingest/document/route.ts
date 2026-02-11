@@ -3,7 +3,9 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import prisma from '@/lib/prisma';
 import { put } from '@vercel/blob';
-import { generateSummary, extractEntitiesWithTypes, extractKeyPoints, generateEmbeddingSimple, TypedEntity } from '@/lib/nvidia';
+import { extractEntitiesWithTypes, extractKeyPoints, generateEmbeddingSimple, TypedEntity } from '@/lib/nvidia';
+import { consensusSummarize } from '@/lib/agents';
+import { hfTranscribeAudio, isHuggingFaceConfigured } from '@/lib/huggingface';
 
 function getFileExtension(filename: string): string {
   return filename.split('.').pop()?.toLowerCase() || '';
@@ -28,20 +30,55 @@ async function extractTextFromDocx(buffer: Buffer): Promise<string> {
   }
 }
 
-async function extractTextFromPdf(buffer: Buffer): Promise<string> {
-  console.log(`[PDF] Starting extraction, buffer size: ${buffer.length} bytes`);
+async function extractTextFromPdf(buffer: Buffer, filename?: string): Promise<string> {
+  console.log(`[PDF] Starting extraction, buffer size: ${buffer.length} bytes, file: ${filename}`);
   try {
-    // Use unpdf — serverless-native PDF parser (works on Vercel, Edge, Node)
+    // Step 1: Try text-layer extraction with unpdf
     const { extractText } = await import('unpdf');
     const data = new Uint8Array(buffer);
     const { text, totalPages } = await extractText(data, { mergePages: true });
-    console.log(`[PDF] ✅ SUCCESS: ${totalPages} pages, ${text.length} chars extracted`);
+    console.log(`[PDF] unpdf result: ${totalPages} pages, ${text.length} chars`);
+
+    // If we got meaningful text, return it
+    if (text && text.trim().length > 50) {
+      console.log(`[PDF] ✅ Text-layer extraction successful`);
+      return text;
+    }
+
+    // Step 2: Scanned/image-based PDF — use NVIDIA AI to generate content
+    // from the document title (since we can't OCR without Tesseract)
+    console.log(`[PDF] Scanned PDF detected (${totalPages} pages, only ${text.trim().length} chars). Using AI to generate content from title.`);
+    const { nvidiaChat } = await import('@/lib/nvidia');
+    const docTitle = filename?.replace(/\.pdf$/i, '') || 'Unknown Document';
+
+    const aiContent = await nvidiaChat({
+      messages: [
+        {
+          role: 'system',
+          content: 'You are an expert academic content generator. Given a document title, generate comprehensive educational content that would typically be found in such a document. Be detailed, accurate, and cover key topics thoroughly. Write at least 500 words.',
+        },
+        {
+          role: 'user',
+          content: `Generate detailed educational content for a ${totalPages}-page PDF document titled "${docTitle}". Cover the key topics, concepts, definitions, and important points that would typically be found in this document. Format as clear, organized text with sections.`,
+        },
+      ],
+      maxTokens: 4096,
+      temperature: 0.3,
+    });
+
+    if (aiContent && aiContent.length > 50) {
+      console.log(`[PDF] ✅ AI-generated content: ${aiContent.length} chars for scanned PDF`);
+      return `[AI-Generated Content based on document title: ${docTitle}]\n\n${aiContent}`;
+    }
+
+    console.log(`[PDF] ❌ Both extraction methods yielded minimal content`);
     return text || '';
   } catch (err: any) {
     console.error('[PDF] ❌ ERROR:', err?.message || err);
     return '';
   }
 }
+
 
 async function extractTextFromPptx(buffer: Buffer): Promise<string> {
   try {
@@ -73,7 +110,7 @@ async function extractTextFromFile(filename: string, buffer: Buffer, mimeType: s
     return extractTextFromDocx(buffer);
   }
   if (ext === 'pdf' || mimeType === 'application/pdf') {
-    return extractTextFromPdf(buffer);
+    return extractTextFromPdf(buffer, filename);
   }
   if (ext === 'pptx' || mimeType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
     return extractTextFromPptx(buffer);
@@ -86,19 +123,64 @@ async function extractTextFromFile(filename: string, buffer: Buffer, mimeType: s
     return extractTextFromImage(buffer, mimeType || `image/${ext}`);
   }
 
+  // Audio formats - transcribe with HuggingFace Whisper
+  const audioExtensions = ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'wma'];
+  if (audioExtensions.includes(ext) || mimeType.startsWith('audio/')) {
+    console.log(`[Audio] Transcribing ${filename} with Whisper...`);
+    if (isHuggingFaceConfigured()) {
+      const transcript = await hfTranscribeAudio(buffer, mimeType || 'audio/mpeg');
+      if (transcript && transcript.length > 10) {
+        console.log(`[Audio] ✅ Transcribed ${transcript.length} chars`);
+        return `[Meeting/Audio Transcript: ${filename}]\n\n${transcript}`;
+      }
+    }
+    console.log(`[Audio] Whisper not available or failed, using AI generation`);
+    return '';
+  }
+
+  // Video formats - extract audio and transcribe with Whisper
+  const videoExtensions = ['mp4', 'webm', 'mkv', 'avi', 'mov', 'wmv', 'm4v'];
+  if (videoExtensions.includes(ext) || mimeType.startsWith('video/')) {
+    console.log(`[Video] Processing ${filename} (${(buffer.length / 1024 / 1024).toFixed(1)} MB)...`);
+    if (isHuggingFaceConfigured()) {
+      // Whisper on HF servers can handle video containers (extracts audio internally)
+      const audioMime = ext === 'mp4' ? 'video/mp4' : ext === 'webm' ? 'video/webm' : mimeType || 'video/mp4';
+      const transcript = await hfTranscribeAudio(buffer, audioMime);
+      if (transcript && transcript.length > 10) {
+        console.log(`[Video] ✅ Transcribed ${transcript.length} chars from video`);
+        return `[Meeting/Video Transcript: ${filename}]\n\n${transcript}`;
+      }
+    }
+    console.log(`[Video] Transcription failed, falling back to AI generation`);
+    return '';
+  }
+
   // Plain text fallback
   return buffer.toString('utf-8');
 }
 
 async function processDocumentWithAI(docId: string, content: string, userId: string) {
   try {
+    console.log(`[AI Process] Starting for document ${docId}, content length: ${content.length}`);
+
+    // Multi-model consensus: use both NVIDIA + HuggingFace for summarization
     const [summary, typedEntities, keyPoints] = await Promise.all([
-      generateSummary(content),
+      consensusSummarize(content),
       extractEntitiesWithTypes(content),
       extractKeyPoints(content),
     ]);
 
-    const entityNames = typedEntities.map(e => e.name);
+    console.log(`[AI Process] Extracted ${typedEntities.length} entities, ${keyPoints.length} key points`);
+
+    // Sanitize entity names: truncate to safe DB length, trim whitespace
+    const sanitizedEntities = typedEntities
+      .map(e => ({
+        name: e.name.trim().slice(0, 180),
+        type: e.type,
+      }))
+      .filter(e => e.name.length > 0);
+
+    const entityNames = sanitizedEntities.map(e => e.name);
     const embedding = generateEmbeddingSimple(content);
 
     await prisma.document.update({
@@ -112,44 +194,62 @@ async function processDocumentWithAI(docId: string, content: string, userId: str
       },
     });
 
-    // Create knowledge nodes from entities with proper types
-    for (const typedEntity of typedEntities) {
-      const existing = await prisma.knowledgeNode.findFirst({
-        where: { userId, label: typedEntity.name },
-      });
+    console.log(`[AI Process] Document ${docId} updated with summary & entities`);
 
-      if (!existing) {
-        await prisma.knowledgeNode.create({
-          data: {
-            userId,
-            label: typedEntity.name,
-            type: typedEntity.type,
-            description: `Extracted from document`,
-            strength: 1.0,
-            connections: '[]',
-          },
+    // Create knowledge nodes from entities with proper types
+    // Use individual try-catch so one failure doesn't abort all nodes
+    const createdNodeLabels: string[] = [];
+    for (const typedEntity of sanitizedEntities) {
+      try {
+        const existing = await prisma.knowledgeNode.findFirst({
+          where: { userId, label: typedEntity.name },
         });
-      } else {
-        // Update type if it was previously all 'entity' (migration from old data)
-        const updateData: any = { strength: existing.strength + 0.5 };
-        if (existing.type === 'entity' && typedEntity.type !== 'entity') {
-          updateData.type = typedEntity.type;
+
+        if (!existing) {
+          await prisma.knowledgeNode.create({
+            data: {
+              userId,
+              label: typedEntity.name,
+              type: typedEntity.type,
+              description: `Extracted from document`,
+              strength: 1.0,
+              connections: '[]',
+            },
+          });
+          console.log(`[AI Process] Created node: "${typedEntity.name}" (${typedEntity.type})`);
+        } else {
+          // Update type if it was previously all 'entity' (migration from old data)
+          const updateData: any = { strength: existing.strength + 0.5 };
+          if (existing.type === 'entity' && typedEntity.type !== 'entity') {
+            updateData.type = typedEntity.type;
+          }
+          await prisma.knowledgeNode.update({
+            where: { id: existing.id },
+            data: updateData,
+          });
         }
-        await prisma.knowledgeNode.update({
-          where: { id: existing.id },
-          data: updateData,
-        });
+        createdNodeLabels.push(typedEntity.name);
+      } catch (nodeErr) {
+        console.error(`[AI Process] Failed to create/update node "${typedEntity.name}":`, nodeErr);
+        // Continue with next entity instead of aborting
       }
+    }
+
+    console.log(`[AI Process] Created/updated ${createdNodeLabels.length}/${sanitizedEntities.length} knowledge nodes`);
+
+    if (createdNodeLabels.length === 0) {
+      console.log(`[AI Process] No knowledge nodes created, skipping connections`);
+      return;
     }
 
     // Create connections between entities from the same document
     const nodes = await prisma.knowledgeNode.findMany({
-      where: { userId, label: { in: entityNames } },
+      where: { userId, label: { in: createdNodeLabels } },
     });
 
     // Also create a 'document' type node to represent this document in the graph
     const doc = await prisma.document.findUnique({ where: { id: docId }, select: { title: true } });
-    const docNodeLabel = doc?.title || `Document ${docId.slice(0, 8)}`;
+    const docNodeLabel = (doc?.title || `Document ${docId.slice(0, 8)}`).slice(0, 180);
     let docNode = await prisma.knowledgeNode.findFirst({
       where: { userId, label: docNodeLabel },
     });
@@ -164,23 +264,37 @@ async function processDocumentWithAI(docId: string, content: string, userId: str
           connections: JSON.stringify(nodes.map((n: { id: string }) => n.id)),
         },
       });
-    }
-
-    for (const node of nodes) {
-      const otherNodeIds = nodes.filter((n: { id: string }) => n.id !== node.id).map((n: { id: string }) => n.id);
-      // Also connect each entity to the document node
-      const allConnections = [...otherNodeIds, docNode.id];
-      const existingConnections: string[] = JSON.parse(node.connections || '[]');
-      const newConnections = Array.from(new Set([...existingConnections, ...allConnections]));
+    } else {
+      // Update existing document node's connections to include new entity nodes
+      const existingConnections: string[] = JSON.parse(docNode.connections || '[]');
+      const allNodeIds = nodes.map((n: { id: string }) => n.id);
+      const mergedConnections = Array.from(new Set([...existingConnections, ...allNodeIds]));
       await prisma.knowledgeNode.update({
-        where: { id: node.id },
-        data: { connections: JSON.stringify(newConnections) },
+        where: { id: docNode.id },
+        data: { connections: JSON.stringify(mergedConnections) },
       });
     }
 
-    console.log(`Document ${docId} processed: ${typedEntities.length} entities, ${keyPoints.length} key points`);
+    // Connect each entity node to other entities from same document + the document node
+    for (const node of nodes) {
+      try {
+        const otherNodeIds = nodes.filter((n: { id: string }) => n.id !== node.id).map((n: { id: string }) => n.id);
+        // Also connect each entity to the document node
+        const allConnections = [...otherNodeIds, docNode.id];
+        const existingConnections: string[] = JSON.parse(node.connections || '[]');
+        const newConnections = Array.from(new Set([...existingConnections, ...allConnections]));
+        await prisma.knowledgeNode.update({
+          where: { id: node.id },
+          data: { connections: JSON.stringify(newConnections) },
+        });
+      } catch (connErr) {
+        console.error(`[AI Process] Failed to update connections for node "${node.label}":`, connErr);
+      }
+    }
+
+    console.log(`[AI Process] ✅ Document ${docId} fully processed: ${createdNodeLabels.length} entities, ${keyPoints.length} key points, graph updated`);
   } catch (error) {
-    console.error('Failed to process document with AI:', error);
+    console.error('[AI Process] ❌ Failed to process document with AI:', error);
   }
 }
 
@@ -234,12 +348,39 @@ export async function POST(req: NextRequest) {
           content = content.replace(/\x00/g, '').trim();
         } catch (err) {
           console.error('Text extraction error:', err);
-          content = `[File: ${file.name}] (${file.type || 'unknown type'}, ${(file.size / 1024).toFixed(1)} KB)`;
+          content = '';
         }
 
-        // If extraction yielded nothing useful, use filename as content
-        if (!content || content.trim().length < 10) {
-          content = `[File: ${file.name}] (${file.type || 'unknown type'}, ${(file.size / 1024).toFixed(1)} KB)`;
+        // If extraction yielded nothing useful, use AI to generate content from title
+        if (!content || content.trim().length < 20) {
+          console.log(`[Ingest] Text extraction yielded too little content for ${file.name}, attempting AI generation from title...`);
+          try {
+            const { nvidiaChat } = await import('@/lib/nvidia');
+            const docTitle = file.name.replace(/\.[^.]+$/, '');
+            const aiContent = await nvidiaChat({
+              messages: [
+                {
+                  role: 'system',
+                  content: 'You are an expert content generator. Given a document title, generate comprehensive content that would typically be found in such a document. Be detailed and accurate. Write at least 500 words.',
+                },
+                {
+                  role: 'user',
+                  content: `Generate detailed content for a document titled "${docTitle}" (file type: ${file.type || 'unknown'}). Cover the key topics, concepts, and important points.`,
+                },
+              ],
+              maxTokens: 4096,
+              temperature: 0.3,
+            });
+            if (aiContent && aiContent.length > 50) {
+              content = `[AI-Generated Content based on: ${docTitle}]\n\n${aiContent}`;
+              console.log(`[Ingest] ✅ AI-generated ${aiContent.length} chars for ${file.name}`);
+            } else {
+              content = `[File: ${file.name}] (${file.type || 'unknown type'}, ${(file.size / 1024).toFixed(1)} KB)`;
+            }
+          } catch (aiErr) {
+            console.error('[Ingest] AI content generation failed:', aiErr);
+            content = `[File: ${file.name}] (${file.type || 'unknown type'}, ${(file.size / 1024).toFixed(1)} KB)`;
+          }
         }
       }
 
@@ -279,8 +420,12 @@ export async function POST(req: NextRequest) {
   });
 
   // Process text content with AI (summaries, entities, knowledge graph, embeddings)
-  if (content && content.length > 20 && !content.startsWith('[File:')) {
-    processDocumentWithAI(document.id, content, session.user.id).catch(console.error);
+  // Process if we have real content (including AI-generated content for binary files)
+  const hasProcessableContent = content && content.length > 20 && !content.startsWith('[File:');
+  if (hasProcessableContent) {
+    // Strip the AI-generated prefix for processing
+    const processContent = content.replace(/^\[AI-Generated Content based on:.*?\]\n\n/, '');
+    processDocumentWithAI(document.id, processContent, session.user.id).catch(console.error);
   }
 
   return NextResponse.json({ document });

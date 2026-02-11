@@ -239,10 +239,10 @@ No explanations, no markdown.`,
     const parsed = JSON.parse(cleaned);
     if (Array.isArray(parsed)) {
       return parsed
-        .filter((e: any) => e && e.name && typeof e.name === 'string')
+        .filter((e: any) => e && e.name && typeof e.name === 'string' && e.name.trim().length > 0)
         .map((e: any) => ({
-          name: e.name,
-          type: ['concept', 'entity', 'idea'].includes(e.type) ? e.type : 'entity',
+          name: e.name.trim(),
+          type: ['concept', 'entity', 'idea'].includes(String(e.type).toLowerCase()) ? String(e.type).toLowerCase() as 'concept' | 'entity' | 'idea' : 'entity',
         }))
         .slice(0, 20);
     }
